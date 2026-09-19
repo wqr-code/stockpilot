@@ -1,0 +1,16 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(require('node:path').join(__dirname, '../demo/upload.js'), 'utf8');
+const context = vm.createContext({});
+vm.runInContext(`let page='sales',tab='current',search='',dataset={as_of:'2026-09-14'};let workspace={statistics:{sales_rows:Array.from({length:400},(_,i)=>({date:'2026-09-13',sku:String(i),name:'商品',units:3,price:'2.50',received:0})),ledger:[{source:'REQ-1',sku:'A',name:'商品',received:10}]}};function filtered(){return [{sku:'A',name:'商品',stock:0,incoming:10,sales_7d:5,sales_30d:8,missing_30d:1}]};` + source.slice(source.indexOf('function detailRows('), source.indexOf('function inventory()')), context);
+assert.equal(vm.runInContext('exportTable().rows.length', context), 400);
+assert.equal(vm.runInContext("search='399';exportTable().rows.length", context), 1);
+assert.equal(vm.runInContext("page='inventory';exportTable().rows[0][7]", context), null);
+assert.equal(vm.runInContext("tab='ledger';search='';exportTable().rows[0].length", context), 7);
+assert.equal(vm.runInContext("exportTable().head.length", context), 7);
+const csv = vm.runInContext(`csvText(['商品','量'], [['茶杯,"白色"',0],['=1+1',null]])`, context);
+assert.ok(csv.startsWith('\ufeff'));
+assert.ok(csv.includes('"茶杯,""白色""","0"'));
+assert.ok(csv.includes('"\'=1+1",""'));
+console.log('Export tests passed: full rows, filters, missing values, ledger columns, CSV escaping.');
