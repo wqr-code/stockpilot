@@ -7,3 +7,5 @@ langgraph>=0.2,<2
 numpy>=1.26,<3
 lightgbm==4.7.0
 xgboost==3.4.1
+sqlalchemy>=2.0,<3
+psycopg[binary]>=3.2,<4

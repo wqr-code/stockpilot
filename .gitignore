@@ -12,7 +12,9 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.pytest-tmp/
 *.egg-info/
+*.db
 dist/
 build/
 .DS_Store

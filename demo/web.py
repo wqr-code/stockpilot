@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
@@ -18,13 +18,101 @@ from demo.retail_sample import sample_tools
 
 app = FastAPI(title='StockPilot')
 datasets = {}
+owners = {}
+loaded_users = set()
 run_lock = asyncio.Lock()
+AUTH_ENABLED = os.getenv('STOCKPILOT_AUTH', '').lower() in ('1', 'true', 'yes')
+accounts = None
+if AUTH_ENABLED:
+    from demo.account_store import AccountStore
+    accounts = AccountStore()
 
 
 class Upload(BaseModel):
     products_csv: str = Field(max_length=2_000_000)
     sales_csv: str = Field(max_length=8_000_000)
     as_of: date
+
+
+class Credentials(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+
+def load_user_workspace(user_id):
+    if not AUTH_ENABLED or user_id in loaded_users:
+        return
+    payload = accounts.load_workspace(user_id)
+    if payload:
+        from demo.workspace_store import loads
+        restored, restored_workflows = loads(payload)
+        datasets.update(restored)
+        workflows.update(restored_workflows)
+        owners.update({key: user_id for key in restored})
+    loaded_users.add(user_id)
+
+
+def current_user(request):
+    if not AUTH_ENABLED:
+        return {'id': 'local', 'email': None}
+    user = accounts.session_user(request.cookies.get('stockpilot_session'))
+    if not user:
+        raise HTTPException(401, '请先登录')
+    load_user_workspace(user['id'])
+    return user
+
+
+def authorize(request, key):
+    user = current_user(request)
+    if owners.get(key) != user['id']:
+        raise HTTPException(404, '工作区不存在')
+    return user
+
+
+def session_response(user):
+    token = accounts.create_session(user['id'])
+    response = Response(status_code=204)
+    response.set_cookie('stockpilot_session', token, max_age=30*24*3600,
+        httponly=True, secure=os.getenv('COOKIE_SECURE', '1') != '0', samesite='lax')
+    return response
+
+
+@app.post('/auth/register')
+async def auth_register(data: Credentials):
+    if not AUTH_ENABLED:
+        raise HTTPException(404)
+    if '@' not in data.email or data.email.startswith('@') or data.email.endswith('@'):
+        raise HTTPException(422, '请输入有效邮箱')
+    try:
+        user = accounts.register(data.email, data.password)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return session_response(user)
+
+
+@app.post('/auth/login')
+async def auth_login(data: Credentials):
+    if not AUTH_ENABLED:
+        raise HTTPException(404)
+    user = accounts.authenticate(data.email, data.password)
+    if not user:
+        raise HTTPException(401, '邮箱或密码错误')
+    return session_response(user)
+
+
+@app.post('/auth/logout')
+async def auth_logout(request: Request):
+    if AUTH_ENABLED:
+        accounts.delete_session(request.cookies.get('stockpilot_session'))
+    response = Response(status_code=204)
+    response.delete_cookie('stockpilot_session')
+    return response
+
+
+@app.get('/auth/me')
+async def auth_me(request: Request):
+    user = current_user(request)
+    return {'auth_enabled': AUTH_ENABLED, 'email': user['email']}
 
 
 
@@ -39,6 +127,11 @@ async def config():
             'model': os.getenv('DEMO_MODEL', ''), 'base_url': os.getenv('DEMO_BASE_URL', '')}
 
 
+@app.get('/health')
+async def health():
+    return {'status': 'ok'}
+
+
 @app.get('/assets/{name}')
 async def asset(name: str):
     types = {'upload.js': 'text/javascript', 'upload.css': 'text/css', 'stockpilot.svg': 'image/svg+xml'}
@@ -49,7 +142,8 @@ async def asset(name: str):
 
 
 @app.get('/detail/{dataset_id}/{sku}')
-async def detail(dataset_id: str, sku: str):
+async def detail(request: Request, dataset_id: str, sku: str):
+    authorize(request, dataset_id)
     entry = datasets.get(dataset_id)
     if entry is None or sku not in entry[0].products:
         raise HTTPException(404, '请重新载入数据或选择商品')
@@ -62,11 +156,14 @@ async def detail(dataset_id: str, sku: str):
 
 
 
-def register(operations, synthetic, key=None):
-    if len(datasets) >= 20:
-        del datasets[next(iter(datasets))]
+def register(operations, synthetic, key=None, owner='local'):
+    user_keys = [item for item in datasets if owners.get(item) == owner]
+    if len(user_keys) >= 3 and key not in user_keys:
+        oldest = user_keys[0]
+        datasets.pop(oldest, None); workflows.pop(oldest, None); owners.pop(oldest, None)
     key = key or uuid.uuid4().hex
     datasets[key] = (operations, synthetic)
+    owners[key] = owner
     products = []
     for sku, p in operations.products.items():
         history, missing = operations.training_history(sku)
@@ -100,25 +197,27 @@ async def download(kind: str):
 
 
 @app.post('/sample')
-async def sample(profile: str = 'standard'):
+async def sample(request: Request, profile: str = 'standard'):
+    user = current_user(request)
     if profile == 'boundary':
-        return register(sample_tools(), True)
+        return register(sample_tools(), True, owner=user['id'])
     from demo.standard_sample import sample_tools as standard_tools, seed_workflow
     ops = standard_tools()
     key = uuid.uuid4().hex
     workflows[key] = seed_workflow(ops)
-    return register(ops, True, key)
+    return register(ops, True, key, user['id'])
 
 
 @app.post('/upload')
-async def upload(data: Upload):
+async def upload(request: Request, data: Upload):
+    user = current_user(request)
     try:
         operations = import_csv(data.products_csv, data.sales_csv, data.as_of.isoformat())
     except ImportFailure as exc:
         raise HTTPException(422, detail=exc.issues) from exc
     except ValueError as exc:
         raise HTTPException(422, detail=[str(exc)]) from exc
-    return register(operations, False)
+    return register(operations, False, owner=user['id'])
 
 
 
@@ -155,7 +254,8 @@ class Repair(BaseModel):
 
 
 @app.post('/repair')
-async def repair(data: Repair):
+async def repair(request: Request, data: Repair):
+    user = authorize(request, data.dataset_id)
     async with run_lock:
         entry = datasets.get(data.dataset_id)
         if entry is None or data.sku not in entry[0].products:
@@ -203,7 +303,7 @@ async def repair(data: Repair):
         workflow = workflows.get(data.dataset_id, {})
         workflow['revision'] = workflow.get('revision', 0) + 1
         workflows.get(data.dataset_id, {}).pop('insight', None)
-        return register(updated, synthetic, data.dataset_id)
+        return register(updated, synthetic, data.dataset_id, user['id'])
 
 
 
@@ -220,26 +320,35 @@ workflows = {}
 
 
 
-from demo.workspace_store import save as store_save, restore as store_restore
+from demo.workspace_store import dumps as store_dumps, save as store_save, restore as store_restore
 
 def save_workspace():
-    store_save(datasets, workflows)
+    if not AUTH_ENABLED:
+        store_save(datasets, workflows)
+        return
+    for user_id in loaded_users:
+        keys = [key for key in datasets if owners.get(key) == user_id]
+        accounts.save_workspace(user_id, store_dumps(datasets, workflows, keys))
 
 @app.get('/workspace')
-async def workspace():
-    if not datasets:
+async def workspace(request: Request):
+    user = current_user(request)
+    keys = [key for key in datasets if owners.get(key) == user['id']]
+    if not keys:
         return {'dataset':None}
-    key=next(reversed(datasets))
+    key=keys[-1]
     ops,synthetic=datasets[key]
-    return {'dataset':register(ops,synthetic,key), 'workflow':workflows.get(key)}
+    return {'dataset':register(ops,synthetic,key,user['id']), 'workflow':workflows.get(key)}
 
 
-store_restore(datasets,workflows)
+if not AUTH_ENABLED:
+    store_restore(datasets,workflows)
+    owners.update({key: 'local' for key in datasets})
 
 from demo.planning_workspace import mount
-mount(app, datasets, workflows, run_lock, save_workspace)
+mount(app, datasets, workflows, run_lock, save_workspace, authorize)
 
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='127.0.0.1', port=3211)
+    uvicorn.run(app, host=os.getenv('HOST', '127.0.0.1'), port=int(os.getenv('PORT', '3211')))

@@ -13,7 +13,7 @@ def release_files():
         if not path.is_file() or path.is_symlink():
             continue
         if len(rel.parts) == 1:
-            if path.suffix not in {'.md', '.txt', '.ini'} and path.name not in {'LICENSE', '.gitignore', '.env.demo.example'}:
+            if path.suffix not in {'.md', '.txt', '.ini'} and path.name not in {'LICENSE', '.gitignore', '.env.demo.example', 'render.yaml'}:
                 continue
         else:
             if rel.parts[0] not in {'demo', 'tests', 'scripts'}:

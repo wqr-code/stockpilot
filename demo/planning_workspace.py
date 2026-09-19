@@ -8,7 +8,7 @@ import uuid
 from copy import deepcopy
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from demo.operations import OperationsTools
@@ -270,7 +270,7 @@ def replenish(ops, state, sku, result, predicted, lead):
         'first_shortage': next((x['date'] for x in trajectory if x['stock'] < 0), None), 'updated': now()}
 
 
-def mount(app, datasets, workflows, lock, save):
+def mount(app, datasets, workflows, lock, save, authorize=lambda request, key: None):
     router = APIRouter(prefix='/planning')
     jobs = {}
     insight_locks = defaultdict(asyncio.Lock)
@@ -309,7 +309,9 @@ def mount(app, datasets, workflows, lock, save):
             state['calculation'] = {'status': 'running', 'done': 0, 'total': len(datasets[key][0].products)}
             jobs[key] = asyncio.create_task(calculate(key))
 
-    def context(key):
+    def context(key, request=None):
+        if request is not None:
+            authorize(request, key)
         if key not in datasets:
             raise HTTPException(404, '请先导入数据')
         state = state_for(workflows, key)
@@ -351,32 +353,32 @@ def mount(app, datasets, workflows, lock, save):
         save()
 
     @router.get('/{key}')
-    async def get_state(key: str, days: int = 30, category: str | None = None, start: date | None = None, end: date | None = None):
-        ops, state = context(key)
+    async def get_state(request: Request, key: str, days: int = 30, category: str | None = None, start: date | None = None, end: date | None = None):
+        ops, state = context(key, request)
         schedule(key)
         return {'state': state, 'statistics': statistics(ops, state, days, category, start, end)}
 
     @router.post('/{key}/start')
-    async def start(key: str, data: Settings):
+    async def start(request: Request, key: str, data: Settings):
         async with lock:
-            ops, state = context(key)
+            ops, state = context(key, request)
             state['parameters'] = data.model_dump()
             state['setup_complete'] = True
             changed(state, '完成首次设置，开始自动计算')
         return {'started': True}
 
     @router.post('/{key}/settings')
-    async def settings(key: str, data: Settings):
+    async def settings(request: Request, key: str, data: Settings):
         async with lock:
-            ops, state = context(key)
+            ops, state = context(key, request)
             state['parameters'] = data.model_dump()
             changed(state, '更新备货规则')
         return state['parameters']
 
     @router.post('/{key}/product/{sku}')
-    async def product_settings(key: str, sku: str, data: ProductSettings):
+    async def product_settings(request: Request, key: str, sku: str, data: ProductSettings):
         async with lock:
-            ops, state = context(key)
+            ops, state = context(key, request)
             if sku not in ops.products:
                 raise HTTPException(404, '商品不存在')
             state['product_settings'][sku] = data.model_dump()
@@ -384,9 +386,9 @@ def mount(app, datasets, workflows, lock, save):
         return {'ok': True}
 
     @router.post('/{key}/forecast/{sku}')
-    async def forecast(key: str, sku: str):
+    async def forecast(request: Request, key: str, sku: str):
         async with lock:
-            ops, state = context(key)
+            ops, state = context(key, request)
             if sku not in ops.products:
                 raise HTTPException(404, '商品不存在')
             result = await evaluate(ops, state, sku)
@@ -395,9 +397,9 @@ def mount(app, datasets, workflows, lock, save):
             return result
 
     @router.post('/{key}/requests')
-    async def create(key: str, data: NewOrder):
+    async def create(request: Request, key: str, data: NewOrder):
         async with lock:
-            ops, state = context(key)
+            ops, state = context(key, request)
             existing = next((o for o in state['requests'] if o['token'] == data.token), None)
             if existing:
                 return existing
@@ -415,9 +417,9 @@ def mount(app, datasets, workflows, lock, save):
             return order
 
     @router.post('/{key}/requests/{order_id}')
-    async def action(key: str, order_id: str, data: Action):
+    async def action(request: Request, key: str, order_id: str, data: Action):
         async with lock:
-            ops, state = context(key)
+            ops, state = context(key, request)
             order = next((o for o in state['requests'] if o['id'] == order_id), None)
             if not order:
                 raise HTTPException(404, '需求单不存在')
@@ -467,11 +469,11 @@ def mount(app, datasets, workflows, lock, save):
             return order
 
     @router.post('/{key}/insight')
-    async def insight(key: str, days: int = 30, category: str | None = None, start: date | None = None, end: date | None = None):
+    async def insight(request: Request, key: str, days: int = 30, category: str | None = None, start: date | None = None, end: date | None = None):
         from demo.analytics_agent import analyze
         async with insight_locks[key]:
             async with lock:
-                ops, state = context(key)
+                ops, state = context(key, request)
                 stats = statistics(ops, state, days, category, start, end)
                 revision = state['revision']
                 cache_key = f"v3|{revision}|{stats['start']}|{stats['end']}|{category or ''}"
