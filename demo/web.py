@@ -129,7 +129,8 @@ async def config():
 
 @app.get('/health')
 async def health():
-    return {'status': 'ok'}
+    commit = os.getenv('RENDER_GIT_COMMIT', 'local')
+    return {'status': 'ok', 'release': commit[:7]}
 
 
 @app.get('/assets/{name}')

@@ -4,6 +4,12 @@ from demo.import_data import ImportFailure, import_csv, template
 from demo.web import app
 
 
+def test_health_reports_release(monkeypatch):
+    monkeypatch.setenv('RENDER_GIT_COMMIT', '843c28f123456789')
+    with TestClient(app) as c:
+        assert c.get('/health').json() == {'status': 'ok', 'release': '843c28f'}
+
+
 def test_import_template_and_missing_history():
     data = import_csv(template('products'), template('sales'), '2026-09-11')
     assert data.products['SKU-001'].available_stock == 120
