@@ -5,6 +5,7 @@ python-dotenv>=1,<2
 openai>=1.40,<3
 langgraph>=0.2,<2
 numpy>=1.26,<3
+scikit-learn>=1.6,<2
 lightgbm==4.7.0
 xgboost==3.4.1
 sqlalchemy>=2.0,<3

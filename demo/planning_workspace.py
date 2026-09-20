@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import asyncio
+import logging
 import uuid
 from copy import deepcopy
 from typing import Literal
@@ -12,6 +13,9 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from demo.operations import OperationsTools
+
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseModel):
@@ -288,6 +292,7 @@ def mount(app, datasets, workflows, lock, save, authorize=lambda request, key: N
                     try:
                         result = await evaluate(ops, snapshot, sku)
                     except Exception:
+                        logger.exception('Forecast calculation failed for dataset=%s sku=%s', key, sku)
                         result = {'sku': sku, 'status': 'blocked', 'reason': '本次计算失败，请重试或检查数据。'}
                     async with lock:
                         if state['revision'] != revision:
